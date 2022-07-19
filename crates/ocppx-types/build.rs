@@ -77,7 +77,9 @@ impl Version {
 fn generate_schemas_for_version(version: Version) -> Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-    let schemas = fs::read_dir(root.join("schemas").join(version.to_str()))
+    let mut compiled_schemas = HashMap::<String, String>::new();
+
+    for schema in fs::read_dir(root.join("schemas").join(version.to_str()))
         .map_err(Error::SchemasNotFound)?
         .filter_map(|entry| match entry {
             Ok(entry) if entry.file_type().expect("Cannot read file type").is_file() => {
@@ -93,8 +95,9 @@ fn generate_schemas_for_version(version: Version) -> Result<()> {
             }
             _ => None,
         })
-        .map(generate_schema)
-        .collect::<Result<Vec<_>>>()?;
+    {
+        generate_schema(schema, &mut compiled_schemas)?;
+    }
 
     let mut into_file_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     into_file_path.push(format!("{version}.rs", version = version.to_name()));
@@ -109,7 +112,11 @@ fn generate_schemas_for_version(version: Version) -> Result<()> {
     file.write_all(
         format!(
             "use serde::{{Serialize, Deserialize}};\n\n{schemas}",
-            schemas = schemas.join("\n\n")
+            schemas = compiled_schemas
+                .values()
+                .map(Clone::clone)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         )
         .as_bytes(),
     )
@@ -131,6 +138,7 @@ struct Schema {
     #[serde(rename = "type")]
     ty: SchemaPropertyType,
     properties: SchemaProperties,
+    required: Option<Vec<String>>,
 }
 
 type SchemaProperties = HashMap<String, SchemaProperty>;
@@ -180,78 +188,102 @@ enum SchemaPropertyType {
     Integer,
 }
 
-fn generate_schema(schema_path: PathBuf) -> Result<String> {
+fn generate_schema(
+    schema_path: PathBuf,
+    compiled_schemas: &mut HashMap<String, String>,
+) -> Result<()> {
     let schema = fs::read_to_string(&schema_path).map_err(Error::SchemaNotFound)?;
     let schema: Schema = serde_json::from_str(schema.as_str()).map_err(Error::InvalidSchema)?;
 
     use SchemaPropertyType::*;
 
-    let compiled = match schema.ty {
-        Object => compile_object(&schema.title, &schema.properties, &schema_path)?,
+    match schema.ty {
+        Object => compile_object(
+            &schema.title,
+            &schema.properties,
+            if let Some(required) = &schema.required {
+                required
+            } else {
+                &[]
+            },
+            &schema_path,
+            compiled_schemas,
+        )?,
         ty => return Err(Error::SchemaTypeNotSupported { ty, schema_path }),
-    };
+    }
 
-    Ok(compiled)
+    Ok(())
 }
 
 fn compile_object(
     raw_name: &str,
     properties: &SchemaProperties,
+    required: &[String],
     schema_path: &PathBuf,
-) -> Result<String> {
+    compiled_schemas: &mut HashMap<String, String>,
+) -> Result<()> {
     let struct_name = raw_name.to_camel();
-    let mut other_objects = HashMap::<String, String>::new();
     let fields = properties
         .iter()
-        .map(|(name, property)| {
-            compile_property(
+        .map(|(raw_name, property)| {
+            let (annotations, name, ty) = compile_property(
                 struct_name.as_str(),
-                name.as_str(),
+                raw_name.as_str(),
                 property,
                 schema_path,
-                &mut other_objects,
-            )
+                compiled_schemas,
+            )?;
+
+            if required.contains(raw_name) {
+                Ok(format!("{annotations}pub r#{name}: {ty},"))
+            } else {
+                Ok(format!("{annotations}pub r#{name}: Option<{ty}>,"))
+            }
         })
         .collect::<Result<Vec<_>>>()?
         .join("\n");
 
-    Ok(format!(
-        "{other_objects}#[derive(validator::Validate)]\npub struct {struct_name} {{\n    {fields}\n}}",
-        other_objects = if other_objects.is_empty() {
-            "".to_string()
-        } else {
-            let mut s = other_objects.values().map(Clone::clone).collect::<Vec<_>>().join("\n");
-            s.push_str("\n\n");
+    compiled_schemas.insert(
+        struct_name.clone(),
+        format!("#[derive(validator::Validate)]\npub struct {struct_name} {{\n    {fields}\n}}",),
+    );
 
-            s
-        }
-    ))
+    Ok(())
 }
 
-fn compile_enum(enum_name: &str, variants: &[String]) -> Result<String> {
+fn compile_enum(
+    enum_name: &str,
+    variants: &[String],
+    compiled_schemas: &mut HashMap<String, String>,
+) -> Result<()> {
     lazy_static! {
         static ref NOT_ID: regex::Regex = regex::Regex::new("[^A-Za-z0-9]").unwrap();
     }
 
-    Ok(format!(
-        "#[derive(Serialize, Deserialize)]\npub enum {enum_name} {{\n    {variants}\n}}",
-        variants = variants
-            .iter()
-            .map(|variant| {
-                let v = variant.to_camel();
-                let mut v = NOT_ID.replace_all(&v, "");
+    compiled_schemas.insert(
+        enum_name.to_string(),
+        format!(
+            "#[derive(Serialize, Deserialize)]\npub enum {enum_name} {{\n    {variants}\n}}",
+            variants = variants
+                .iter()
+                .map(|variant| {
+                    let v = variant.to_camel();
+                    let mut v = NOT_ID.replace_all(&v, "");
 
-                if &v != variant {
-                    v = Cow::Owned(format!("#[serde(rename = \"{variant}\")] {v}"));
-                }
+                    if &v != variant {
+                        v = Cow::Owned(format!("#[serde(rename = \"{variant}\")] {v}"));
+                    }
 
-                v.to_mut().push(',');
+                    v.to_mut().push(',');
 
-                v.into_owned()
-            })
-            .collect::<Vec<_>>()
-            .join("\n    ")
-    ))
+                    v.into_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n    ")
+        ),
+    );
+
+    Ok(())
 }
 
 fn compile_property(
@@ -259,13 +291,12 @@ fn compile_property(
     raw_name: &str,
     property: &SchemaProperty,
     schema_path: &PathBuf,
-    other_objects: &mut HashMap<String, String>,
-) -> Result<String> {
+    compiled_schemas: &mut HashMap<String, String>,
+) -> Result<(String, String, String)> {
     use SchemaPropertyType::*;
 
-    Ok(format!(
-        "{validate}pub r#{name}: {ty},",
-        validate = {
+    Ok((
+        {
             let mut v = [match (&property.min_length, &property.max_length) {
                 (None, Some(max)) => Some(format!("#[validate(length(min = 1, max = {max}))]")),
                 (Some(min), Some(max)) => {
@@ -287,8 +318,8 @@ fn compile_property(
                 v
             }
         },
-        name = raw_name.to_snake(),
-        ty = match &property.ty {
+        raw_name.to_snake(),
+        match &property.ty {
             Boolean => "bool".to_string(),
 
             String => {
@@ -306,16 +337,9 @@ fn compile_property(
                     }
                     .to_string()
                 } else if let Some(variants) = &property.r#enum {
-                    let enum_name = format!(
-                        "{prefix}{suffix}",
-                        prefix = struct_name,
-                        suffix = raw_name.to_camel()
-                    );
+                    let enum_name = raw_name.to_camel();
 
-                    other_objects.insert(
-                        enum_name.clone(),
-                        compile_enum(enum_name.as_str(), variants)?,
-                    );
+                    compile_enum(enum_name.as_str(), variants, compiled_schemas)?;
 
                     enum_name
                 } else {
@@ -332,25 +356,27 @@ fn compile_property(
                     Some(&SchemaProperty {
                         ty: Object,
                         properties: Some(ref properties),
+                        ref required,
                         ..
                     }) => {
-                        let struct_name = format!(
-                            "{prefix}{suffix}",
-                            prefix = struct_name,
-                            suffix = raw_name.to_camel(),
-                        );
+                        let struct_name = raw_name.to_camel();
 
-                        other_objects.insert(
-                            struct_name.clone(),
-                            compile_object(struct_name.as_str(), properties, schema_path)?,
-                        );
+                        compile_object(
+                            struct_name.as_str(),
+                            properties,
+                            if let Some(required) = required {
+                                required
+                            } else {
+                                &[]
+                            },
+                            schema_path,
+                            compiled_schemas,
+                        )?;
 
                         format!("Vec<{struct_name}>")
                     }
 
-                    Some(&SchemaProperty { ty: String, .. }) => {
-                        format!("Vec<String>")
-                    }
+                    Some(&SchemaProperty { ty: String, .. }) => "Vec<String>".to_string(),
 
                     _ => {
                         return Err(Error::SchemaPropertyTypeNotSupported {
@@ -364,16 +390,19 @@ fn compile_property(
 
             Object => {
                 if let Some(properties) = &property.properties {
-                    let struct_name = format!(
-                        "{prefix}{suffix}",
-                        prefix = struct_name,
-                        suffix = raw_name.to_camel(),
-                    );
+                    let struct_name = raw_name.to_camel();
 
-                    other_objects.insert(
-                        struct_name.clone(),
-                        compile_object(struct_name.as_str(), &properties, schema_path)?,
-                    );
+                    compile_object(
+                        struct_name.as_str(),
+                        properties,
+                        if let Some(required) = &property.required {
+                            required
+                        } else {
+                            &[]
+                        },
+                        schema_path,
+                        compiled_schemas,
+                    )?;
 
                     struct_name
                 } else {
@@ -385,12 +414,13 @@ fn compile_property(
                 }
             }
 
-            ty =>
+            ty => {
                 return Err(Error::SchemaPropertyTypeNotSupported {
                     name: raw_name.to_owned(),
                     ty: *ty,
-                    schema_path: schema_path.clone()
-                }),
-        }
+                    schema_path: schema_path.clone(),
+                })
+            }
+        },
     ))
 }
