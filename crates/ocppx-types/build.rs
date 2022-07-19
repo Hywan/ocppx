@@ -27,10 +27,16 @@ enum Error {
     CompiledSchemaCannotBeSaved(io::Error),
 
     #[error("cannot found a schema file")]
-    SchemaNotFound(io::Error),
+    SchemaNotFound {
+        error: io::Error,
+        schema_path: PathBuf,
+    },
 
     #[error("cannot read a particular schema")]
-    InvalidSchema(serde_json::Error),
+    InvalidSchema {
+        error: serde_json::Error,
+        schema_path: PathBuf,
+    },
 
     #[error("schema type not supported: `{ty:?}` in `{schema_path}`")]
     SchemaTypeNotSupported {
@@ -192,8 +198,15 @@ fn generate_schema(
     schema_path: PathBuf,
     compiled_schemas: &mut HashMap<String, String>,
 ) -> Result<()> {
-    let schema = fs::read_to_string(&schema_path).map_err(Error::SchemaNotFound)?;
-    let schema: Schema = serde_json::from_str(schema.as_str()).map_err(Error::InvalidSchema)?;
+    let schema = fs::read_to_string(&schema_path).map_err(|error| Error::SchemaNotFound {
+        error,
+        schema_path: schema_path.clone(),
+    })?;
+    let schema: Schema =
+        serde_json::from_str(schema.as_str()).map_err(|error| Error::InvalidSchema {
+            error,
+            schema_path: schema_path.clone(),
+        })?;
 
     use SchemaPropertyType::*;
 
