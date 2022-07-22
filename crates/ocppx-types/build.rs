@@ -111,6 +111,7 @@ fn generate_schemas_for_version(version: Version) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .read(false)
         .open(into_file_path.clone())
         .map_err(Error::CompiledSchemaCannotBeSaved)?;
@@ -258,7 +259,7 @@ fn compile_object(
 
     compiled_schemas.insert(
         struct_name.clone(),
-        format!("#[derive(validator::Validate)]\npub struct {struct_name} {{\n    {fields}\n}}",),
+        format!("#[derive(Debug, Clone, Serialize, Deserialize, validator::Validate)]\npub struct {struct_name} {{\n    {fields}\n}}",),
     );
 
     Ok(())
@@ -276,7 +277,7 @@ fn compile_enum(
     compiled_schemas.insert(
         enum_name.to_string(),
         format!(
-            "#[derive(Serialize, Deserialize)]\npub enum {enum_name} {{\n    {variants}\n}}",
+            "#[derive(Debug, Copy, Clone, Serialize, Deserialize)]\npub enum {enum_name} {{\n    {variants}\n}}",
             variants = variants
                 .iter()
                 .map(|variant| {
